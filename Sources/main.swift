@@ -1,4 +1,5 @@
 import Cocoa
+import ServiceManagement
 import UserNotifications
 
 // Menu-bar check of this app's own public exit.
@@ -10,6 +11,7 @@ private let keyLastLevel = "lastLevel"
 private let keyLastIP = "lastIP"
 private let keyAuto = "autoRefresh"
 private let keyNotify = "notify"
+private let keyLoginOffered = "loginItemOffered"
 private let refreshSeconds: TimeInterval = 300
 
 private func flag(_ key: String, default fallback: Bool) -> Bool {
@@ -318,6 +320,11 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     func applicationDidFinishLaunching(_ notification: Notification) {
         if defaults.object(forKey: keyAuto) == nil { defaults.set(true, forKey: keyAuto) }
         if defaults.object(forKey: keyNotify) == nil { defaults.set(true, forKey: keyNotify) }
+        // Register as a login item once; after that the menu toggle owns it.
+        if !defaults.bool(forKey: keyLoginOffered) {
+            try? SMAppService.mainApp.register()
+            defaults.set(true, forKey: keyLoginOffered)
+        }
         placeBesideWiFiIfUnset()
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem.autosaveName = "ExitCheck"
@@ -464,6 +471,11 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         notify.state = flag(keyNotify, default: true) ? .on : .off
         menu.addItem(notify)
 
+        let login = NSMenuItem(title: "Open at Login", action: #selector(toggleLogin), keyEquivalent: "")
+        login.target = self
+        login.state = SMAppService.mainApp.status == .enabled ? .on : .off
+        menu.addItem(login)
+
         let copy = NSMenuItem(title: "Copy Diagnostics", action: #selector(copySummary), keyEquivalent: "c")
         copy.target = self
         copy.isEnabled = lastVerdict != nil
@@ -519,6 +531,14 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
 
     @objc private func toggleNotify(_ sender: NSMenuItem) {
         defaults.set(sender.state != .on, forKey: keyNotify)
+    }
+
+    @objc private func toggleLogin(_ sender: NSMenuItem) {
+        if sender.state == .on {
+            try? SMAppService.mainApp.unregister()
+        } else {
+            try? SMAppService.mainApp.register()
+        }
     }
 
     @objc private func copySummary() {

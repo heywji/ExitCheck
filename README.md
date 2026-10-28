@@ -27,6 +27,7 @@ Copy `dist/ExitCheck.app` to `/Applications` if you want it beside your other ap
 - **Pin Current IP** stores the address just seen. The item then reads **Unpin**. A different address while still in the US turns the shield yellow.
 - **Check Every 5 Minutes** repeats the lookup.
 - **Notify When Exit Is Not US** posts a notification when the result changes to a failure.
+- **Open at Login** starts ExitCheck when you log in. It is turned on the first time the app runs.
 - **Copy Diagnostics** puts the latest result on the clipboard.
 
 Hold Command and drag the menu bar item to move it. The first launch tries to place it beside Wi-Fi.
