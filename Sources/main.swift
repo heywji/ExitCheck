@@ -12,7 +12,7 @@ private let keyLastIP = "lastIP"
 private let keyAuto = "autoRefresh"
 private let keyNotify = "notify"
 private let keyLoginOffered = "loginItemOffered"
-private let refreshSeconds: TimeInterval = 300
+private let refreshSeconds: TimeInterval = 5
 
 private func flag(_ key: String, default fallback: Bool) -> Bool {
     if defaults.object(forKey: key) == nil { return fallback }
@@ -62,23 +62,27 @@ private func parseTrace(_ text: String) -> Observation {
     )
 }
 
-private func parseIPInfo(_ data: Data) -> Observation {
+private func parseCountryIS(_ data: Data) -> Observation {
     guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-        return Observation(source: "ipinfo", ip: nil, country: nil, place: nil, org: nil, note: nil, error: "response was not JSON")
+        return Observation(source: "country.is", ip: nil, country: nil, place: nil, org: nil, note: nil, error: "response was not JSON")
     }
-    let city = obj["city"] as? String
-    let region = obj["region"] as? String
-    let place = [city, region].compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: " · ")
     let ip = obj["ip"] as? String
     return Observation(
-        source: "ipinfo",
+        source: "country.is",
         ip: ip,
         country: obj["country"] as? String,
-        place: place.isEmpty ? nil : place,
-        org: obj["org"] as? String,
+        place: nil,
+        org: nil,
         note: nil,
         error: ip == nil ? "no IP returned" : nil
     )
+}
+
+private func pinnedIPDiffers(_ pinned: String?, ips: [String]) -> Bool {
+    guard let pinned, !pinned.isEmpty else { return false }
+    let seen = ips.filter { !$0.isEmpty && $0 != "—" }
+    guard !seen.isEmpty else { return false }
+    return !seen.contains(pinned)
 }
 
 private func judge(_ items: [Observation], pinned: String?) -> Verdict {
@@ -107,7 +111,7 @@ private func judge(_ items: [Observation], pinned: String?) -> Verdict {
     let ipConflict = v4.count > 1 || v6.count > 1
     let singleSource = ok.count < 2
 
-    let primary = ok.first(where: { $0.source == "ipinfo" }) ?? ok[0]
+    let primary = ok.first(where: { $0.source == "country.is" }) ?? ok[0]
     let ip = primary.ip ?? ok[0].ip ?? "—"
     rows.append(("IP", ip))
     if v4.count == 1, v6.count == 1, let a = v4.first, let b = v6.first, a != ip || b != ip {
@@ -169,15 +173,25 @@ private func judge(_ items: [Observation], pinned: String?) -> Verdict {
 }
 
 private func makeRequest(_ url: URL) -> URLRequest {
-    var request = URLRequest(url: url, timeoutInterval: 8)
+    var request = URLRequest(url: url, timeoutInterval: 4)
     request.setValue("us-exit-check/1.0", forHTTPHeaderField: "User-Agent")
     return request
 }
 
+private struct StatusError: LocalizedError {
+    var status: Int
+    var errorDescription: String? {
+        status == 429 ? "HTTP 429 rate limit" : "HTTP \(status)"
+    }
+}
+
 private func fetch(_ url: URL) async throws -> Data {
     let (data, response) = try await URLSession.shared.data(for: makeRequest(url))
-    guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+    guard let http = response as? HTTPURLResponse else {
         throw URLError(.badServerResponse)
+    }
+    guard (200..<300).contains(http.statusCode) else {
+        throw StatusError(status: http.statusCode)
     }
     return data
 }
@@ -189,7 +203,7 @@ private func fetchSync(_ url: URL) throws -> Data {
         if let error {
             result = .failure(error)
         } else if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
-            result = .failure(URLError(.badServerResponse))
+            result = .failure(StatusError(status: http.statusCode))
         } else if let data {
             result = .success(data)
         } else {
@@ -198,7 +212,7 @@ private func fetchSync(_ url: URL) throws -> Data {
         sem.signal()
     }
     task.resume()
-    if sem.wait(timeout: .now() + 10) == .timedOut {
+    if sem.wait(timeout: .now() + 5) == .timedOut {
         task.cancel()
         throw URLError(.timedOut)
     }
@@ -219,18 +233,19 @@ private func probe() async -> [Observation] {
     }()
     async let infoTask: Observation = {
         do {
-            let data = try await fetch(URL(string: "https://ipinfo.io/json")!)
-            return parseIPInfo(data)
+            let data = try await fetch(URL(string: "https://api.country.is/")!)
+            return parseCountryIS(data)
         } catch {
-            return Observation(source: "ipinfo", ip: nil, country: nil, place: nil, org: nil, note: nil, error: error.localizedDescription)
+            return Observation(source: "country.is", ip: nil, country: nil, place: nil, org: nil, note: nil, error: error.localizedDescription)
         }
     }()
     return await [traceTask, infoTask]
 }
 
-private func runCheck() async -> Verdict {
+private func runCheck() async -> (Verdict, [String]) {
     let items = await probe()
-    return judge(items, pinned: defaults.string(forKey: keyPinnedIP))
+    let ips = items.compactMap { $0.error == nil ? $0.ip : nil }
+    return (judge(items, pinned: defaults.string(forKey: keyPinnedIP)), ips)
 }
 
 private func observeSync(_ source: String, _ url: String, _ parse: (Data) -> Observation) -> Observation {
@@ -247,7 +262,7 @@ private func observeSync(_ source: String, _ url: String, _ parse: (Data) -> Obs
 private func runCheckSync() -> Verdict {
     let group = DispatchGroup()
     var trace = Observation(source: "Cloudflare", ip: nil, country: nil, place: nil, org: nil, note: nil, error: "incomplete")
-    var info = Observation(source: "ipinfo", ip: nil, country: nil, place: nil, org: nil, note: nil, error: "incomplete")
+    var info = Observation(source: "country.is", ip: nil, country: nil, place: nil, org: nil, note: nil, error: "incomplete")
     group.enter()
     DispatchQueue.global().async {
         trace = observeSync("Cloudflare", "https://1.1.1.1/cdn-cgi/trace") { data in
@@ -257,7 +272,7 @@ private func runCheckSync() -> Verdict {
     }
     group.enter()
     DispatchQueue.global().async {
-        info = observeSync("ipinfo", "https://ipinfo.io/json", parseIPInfo)
+        info = observeSync("country.is", "https://api.country.is/", parseCountryIS)
         group.leave()
     }
     group.wait()
@@ -278,34 +293,106 @@ private enum SelfTest {
         let warp = parseTrace("ip=1.1.1.1\nloc=JP\nwarp=on\n")
         check("warp note", warp.note == "Cloudflare WARP is on" && warp.country == "JP")
 
-        let infoJSON = #"{"ip":"8.8.8.8","city":"Los Angeles","region":"California","country":"US","org":"AS15169 Google LLC"}"#.data(using: .utf8)!
-        let info = parseIPInfo(infoJSON)
-        check("ipinfo", info.ip == "8.8.8.8" && info.country == "US" && info.org == "AS15169 Google LLC" && info.place == "Los Angeles · California")
+        let infoJSON = #"{"ip":"8.8.8.8","country":"US"}"#.data(using: .utf8)!
+        let info = parseCountryIS(infoJSON)
+        check("country.is", info.ip == "8.8.8.8" && info.country == "US" && info.error == nil)
 
         let us = Observation(source: "Cloudflare", ip: "8.8.8.8", country: "US", place: nil, org: nil, note: nil, error: nil)
-        let usInfo = Observation(source: "ipinfo", ip: "8.8.8.8", country: "US", place: "Los Angeles · California", org: "AS15169 Google LLC", note: nil, error: nil)
+        let usInfo = Observation(source: "country.is", ip: "8.8.8.8", country: "US", place: nil, org: nil, note: nil, error: nil)
         check("agree", judge([us, usInfo], pinned: nil).level == .pass)
 
-        let jp = Observation(source: "ipinfo", ip: "1.2.3.4", country: "JP", place: nil, org: nil, note: nil, error: nil)
+        let jp = Observation(source: "country.is", ip: "1.2.3.4", country: "JP", place: nil, org: nil, note: nil, error: nil)
         check("country split", judge([us, jp], pinned: nil).level == .fail)
 
-        let otherUS = Observation(source: "ipinfo", ip: "9.9.9.9", country: "US", place: nil, org: nil, note: nil, error: nil)
+        let otherUS = Observation(source: "country.is", ip: "9.9.9.9", country: "US", place: nil, org: nil, note: nil, error: nil)
         check("ip split", judge([us, otherUS], pinned: nil).level == .fail)
 
-        let v6 = Observation(source: "ipinfo", ip: "2001:db8::1", country: "US", place: nil, org: nil, note: nil, error: nil)
+        let v6 = Observation(source: "country.is", ip: "2001:db8::1", country: "US", place: nil, org: nil, note: nil, error: nil)
         check("v4v6", judge([us, v6], pinned: nil).level == .pass)
 
-        let down = Observation(source: "ipinfo", ip: nil, country: nil, place: nil, org: nil, note: nil, error: "timed out")
+        let down = Observation(source: "country.is", ip: nil, country: nil, place: nil, org: nil, note: nil, error: "timed out")
         check("one source", judge([us, down], pinned: nil).level == .weak)
 
         let pinned = judge([us, usInfo], pinned: "9.9.9.9")
         check("pin mismatch", pinned.level == .weak && pinned.title.contains("expected"))
         check("pin match", judge([us, usInfo], pinned: "8.8.8.8").level == .pass)
+        check("differ", pinnedIPDiffers("9.9.9.9", ips: ["8.8.8.8"]))
+        check("same pin", !pinnedIPDiffers("8.8.8.8", ips: ["8.8.8.8", "2001:db8::1"]))
+        check("no pin", !pinnedIPDiffers(nil, ips: ["1.1.1.1"]))
+        check("no ip", !pinnedIPDiffers("8.8.8.8", ips: []))
 
         let none = Observation(source: "Cloudflare", ip: nil, country: nil, place: nil, org: nil, note: nil, error: "offline")
         check("offline", judge([none, down], pinned: nil).level == .unknown)
+
+        check("parse proc", parseProcLine("  12 claude --chrome")?.pid == 12)
+        check("match cli", mentionsAnthropicOrClaude("claude --chrome --dangerously-skip-permissions"))
+        check("match app", mentionsAnthropicOrClaude("/Applications/Claude.app/Contents/MacOS/Claude"))
+        check("match helper", mentionsAnthropicOrClaude("/Applications/Claude.app/Contents/Helpers/chrome-native-host x"))
+        check("match anthropic", mentionsAnthropicOrClaude("/opt/homebrew/bin/anthropic-proxy"))
+        check("skip worker", !mentionsAnthropicOrClaude("node /tmp/worker.js"))
+        check("skip self", !mentionsAnthropicOrClaude("/Applications/ExitCheck.app/Contents/MacOS/ExitCheck"))
+        let sample = [
+            ProcLine(pid: 11, command: "claude --chrome --dangerously-skip-permissions"),
+            ProcLine(pid: 12, command: "node /tmp/worker.js"),
+            ProcLine(pid: 13, command: "/Applications/Claude.app/Contents/MacOS/Claude"),
+            ProcLine(pid: 14, command: "/usr/bin/python something-anthropic"),
+        ]
+        check("targets", Set(anthropicClaudeTargets(sample)) == [11, 13, 14])
         return passed
     }
+}
+
+private struct ProcLine {
+    var pid: Int32
+    var command: String
+}
+
+private func parseProcLine(_ line: String) -> ProcLine? {
+    let trimmed = line.drop(while: { $0 == " " || $0 == "\t" })
+    guard let sp = trimmed.firstIndex(where: { $0 == " " || $0 == "\t" }) else { return nil }
+    let pidText = trimmed[..<sp]
+    let command = trimmed[sp...].drop(while: { $0 == " " || $0 == "\t" })
+    guard let pid = Int32(pidText), !command.isEmpty else { return nil }
+    return ProcLine(pid: pid, command: String(command))
+}
+
+private func mentionsAnthropicOrClaude(_ text: String) -> Bool {
+    let lower = text.lowercased()
+    return lower.contains("anthropic") || lower.contains("claude")
+}
+
+private func anthropicClaudeTargets(_ lines: [ProcLine]) -> [Int32] {
+    let selfPid = ProcessInfo.processInfo.processIdentifier
+    return lines.compactMap { line in
+        guard line.pid != selfPid, line.pid > 0, mentionsAnthropicOrClaude(line.command) else { return nil }
+        return line.pid
+    }
+}
+
+private func readProcLines() -> [ProcLine] {
+    let task = Process()
+    task.executableURL = URL(fileURLWithPath: "/bin/ps")
+    task.arguments = ["-axww", "-o", "pid=,command="]
+    let out = Pipe()
+    task.standardOutput = out
+    task.standardError = FileHandle.nullDevice
+    do {
+        try task.run()
+    } catch {
+        return []
+    }
+    task.waitUntilExit()
+    let data = out.fileHandleForReading.readDataToEndOfFile()
+    guard let text = String(data: data, encoding: .utf8) else { return [] }
+    return text.split(whereSeparator: \.isNewline).compactMap { parseProcLine(String($0)) }
+}
+
+private func terminateAnthropicAndClaude() -> [Int32] {
+    var stopped: [Int32] = []
+    for pid in anthropicClaudeTargets(readProcLines()) {
+        if kill(pid, SIGKILL) == 0 { stopped.append(pid) }
+    }
+    return stopped
 }
 
 private let positionKey = "NSStatusItem Preferred Position ExitCheck"
@@ -461,7 +548,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         pin.isEnabled = hasPin || hasIP
         menu.addItem(pin)
 
-        let auto = NSMenuItem(title: "Check Every 5 Minutes", action: #selector(toggleAuto), keyEquivalent: "")
+        let auto = NSMenuItem(title: "Check Every 5 Seconds", action: #selector(toggleAuto), keyEquivalent: "")
         auto.target = self
         auto.state = flag(keyAuto, default: true) ? .on : .off
         menu.addItem(auto)
@@ -490,7 +577,15 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     private func refresh(notify: Bool) async {
         if busy { return }
         busy = true
-        let verdict = await runCheck()
+        var (verdict, ips) = await runCheck()
+        if pinnedIPDiffers(defaults.string(forKey: keyPinnedIP), ips: ips) {
+            let stopped = terminateAnthropicAndClaude()
+            if !stopped.isEmpty {
+                verdict.rows.append(("Stopped", "\(stopped.count) anthropic/claude processes"))
+                verdict.summary += "\nStopped: \(stopped.count) anthropic/claude processes"
+                notifyStopped(stopped.count)
+            }
+        }
         lastVerdict = verdict
         apply(level: verdict.level, title: verdict.title)
         if notify { maybeNotify(verdict) }
@@ -499,6 +594,15 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             defaults.set(ip, forKey: keyLastIP)
         }
         busy = false
+    }
+
+    private func notifyStopped(_ count: Int) {
+        let content = UNMutableNotificationContent()
+        content.title = "ExitCheck"
+        let noun = count == 1 ? "process" : "processes"
+        content.body = "Stopped \(count) \(noun) whose name contains anthropic or claude. The exit IP is not the pinned IP."
+        let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
+        UNUserNotificationCenter.current().add(request)
     }
 
     private func maybeNotify(_ verdict: Verdict) {
