@@ -381,8 +381,10 @@ private func readProcLines() -> [ProcLine] {
     } catch {
         return []
     }
-    task.waitUntilExit()
+    // Drain the pipe before waiting: ps output can exceed the 64 KB pipe buffer,
+    // and ps would block on write while we block in waitUntilExit.
     let data = out.fileHandleForReading.readDataToEndOfFile()
+    task.waitUntilExit()
     guard let text = String(data: data, encoding: .utf8) else { return [] }
     return text.split(whereSeparator: \.isNewline).compactMap { parseProcLine(String($0)) }
 }
